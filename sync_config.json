@@ -1,0 +1,10 @@
+{
+  "base_url": "https://pan.sykbsm.net",
+  "source_root": "/wangyuheng",
+  "destination_roots": ["/gongyun", "/local"],
+  "start_year": 2026,
+  "existing_directories": "skip",
+  "request_timeout_seconds": 120,
+  "run_timeout_seconds": 18000,
+  "poll_interval_seconds": 10
+}

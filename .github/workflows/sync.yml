@@ -1,0 +1,65 @@
+name: OpenList daily sync
+
+on:
+  schedule:
+    # UTC 19:17 = 香港 / 北京时间次日 03:17
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只预览，不创建目录或复制文件（首次运行建议勾选）'
+        type: boolean
+        default: true
+      existing_directories:
+        description: 'config=使用配置；skip=跳过同名目录；recurse=进入目录只补新文件'
+        type: choice
+        default: config
+        options:
+          - config
+          - skip
+          - recurse
+  push:
+    paths:
+      - 'sync_openlist.py'
+      - 'tests/**'
+      - 'sync_config.json'
+      - '.github/workflows/sync.yml'
+  pull_request:
+    paths:
+      - 'sync_openlist.py'
+      - 'tests/**'
+      - 'sync_config.json'
+      - '.github/workflows/sync.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests (no secrets or network)
+        run: python3 -m unittest discover -s tests -v
+
+  sync:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: openlist-sync
+      cancel-in-progress: false
+    env:
+      OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+      EXISTING_DIRECTORIES: ${{ inputs.existing_directories || 'config' }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Sync new files via OpenList server-side copy
+        run: python3 sync_openlist.py --config sync_config.json

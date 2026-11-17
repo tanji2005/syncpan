@@ -3,7 +3,7 @@
   "source_root": "/wangyuheng",
   "destination_roots": ["/gongyun", "/local"],
   "start_year": 2026,
-  "existing_directories": "skip",
+  "existing_directories": "recurse",
   "request_timeout_seconds": 120,
   "run_timeout_seconds": 600
 }

@@ -11,13 +11,13 @@ on:
         type: boolean
         default: true
       existing_directories:
-        description: 'config=使用配置；skip=跳过同名目录；recurse=进入目录只补新文件'
+        description: 'config=默认递归补齐；recurse=进入目录只补新文件；skip=整个已有目录跳过'
         type: choice
         default: config
         options:
           - config
-          - skip
           - recurse
+          - skip
   push:
     branches:
       - main

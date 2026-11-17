@@ -134,14 +134,14 @@ class OpenList:
                 raise SyncError(f"Incomplete directory listing: {path}")
             page += 1
 
-    def submit_copy(self, source, destination, names):
+    def submit_copy(self, source, destination, names, *, merge=False):
         if not names:
             return []
         for name in names:
             child(source, name)
         data = self.api("/api/fs/copy", {
             "src_dir": source, "dst_dir": destination, "names": names,
-            "overwrite": False, "skip_existing": True, "merge": False,
+            "overwrite": False, "skip_existing": True, "merge": merge,
         })
         # Directories are expanded by OpenList, not by this runner. A task may
         # still be pending, running, or fail later; acceptance != completion.
@@ -169,14 +169,14 @@ class Syncer:
             self.source_cache[path] = self.api.list_dir(path)
         return self.source_cache[path]
 
-    def submit(self, source, destination, entries):
+    def submit(self, source, destination, entries, *, merge=False):
         for offset in range(0, len(entries), BATCH_SIZE):
             batch = entries[offset:offset + BATCH_SIZE]
             names = [entry["name"] for entry in batch]
-            LOG.info("%s %s -> %s names=%s", "PLAN submit" if self.dry_run else "SUBMIT",
-                     source, destination, json.dumps(names, ensure_ascii=False))
+            LOG.info("%s %s -> %s names=%s merge=%s", "PLAN submit" if self.dry_run else "SUBMIT",
+                     source, destination, json.dumps(names, ensure_ascii=False), merge)
             if not self.dry_run:
-                tasks = self.api.submit_copy(source, destination, names)
+                tasks = self.api.submit_copy(source, destination, names, merge=merge)
                 self.counts["copy_requests_accepted"] += 1
                 self.counts["tasks_returned"] += len(tasks)
                 for task in tasks:
@@ -184,28 +184,21 @@ class Syncer:
             for entry in batch:
                 kind = "directories" if entry["is_dir"] else "files"
                 self.counts[f"{kind}_{'planned' if self.dry_run else 'submitted'}"] += 1
+                if merge and entry["is_dir"]:
+                    self.counts[f"merge_directories_{'planned' if self.dry_run else 'submitted'}"] += 1
 
-    def tree(self, source, destination):
-        stack = [(source, destination)]
-        while stack:
-            src, dst = stack.pop()
-            target = self.api.list_dir(dst)
-            self.counts["directories_scanned"] += 1
-            missing = []
-            for name, entry in sorted(self.source_entries(src).items()):
-                src_path, dst_path = child(src, name), child(dst, name)
-                existing = target.get(name)
-                if existing is not None:
-                    if entry["is_dir"] and existing["is_dir"] and self.config["existing_directories"] == "recurse":
-                        stack.append((src_path, dst_path))
-                    else:
-                        self.counts["directories_skipped" if entry["is_dir"] else "files_skipped"] += 1
-                        LOG.info("SKIP existing %s", dst_path)
-                    continue
-                # Submit the whole missing directory. OpenList creates the folder
-                # and recursively queues its contents after this process exits.
+    def copy_missing_children(self, source, destination):
+        # Optional strict-skip mode; the default uses server-side year merging.
+        target = self.api.list_dir(destination)
+        self.counts["directories_scanned"] += 1
+        missing = []
+        for name, entry in sorted(self.source_entries(source).items()):
+            if name in target:
+                self.counts["directories_skipped" if entry["is_dir"] else "files_skipped"] += 1
+                LOG.info("SKIP existing %s", child(destination, name))
+            else:
                 missing.append(entry)
-            self.submit(src, dst, missing)
+        self.submit(source, destination, missing)
 
     def run(self):
         source = self.config["source_root"]
@@ -226,11 +219,17 @@ class Syncer:
                         LOG.warning("SKIP year path occupied by a file: %s", dst)
                         self.counts["files_skipped"] += 1
                         continue
+                    if self.config["existing_directories"] == "recurse":
+                        # OpenList's merge task recursively enters same-name
+                        # directories and skips existing files in the backend.
+                        # Do not scan every month/file on the GitHub runner.
+                        self.submit(source, root, [self.source_entries(source)[year]], merge=True)
+                        continue
                     if entry is None:
                         self.submit(source, root, [self.source_entries(source)[year]])
                         continue
                     # Year directories are routing containers, not items subject to directory skipping.
-                    self.tree(src, dst)
+                    self.copy_missing_children(src, dst)
             except SyncError as exc:
                 LOG.error("Destination %s failed: %s", root, exc)
                 failures.append(root)

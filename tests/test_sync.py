@@ -33,17 +33,28 @@ class MemoryAPI:
             for name, value in self.node(path).items()
         }
 
-    def submit_copy(self, source, destination, names):
+    def submit_copy(self, source, destination, names, *, merge=False):
         self.writes.append((source, destination, names))
-        self.pending.append((source, destination, names))
+        self.pending.append((source, destination, names, merge))
         return [{"id": f"task-{len(self.writes)}", "state": 0}]
 
     def finish_pending(self):
         # Simulate work performed by OpenList AFTER the submitting process exits.
-        for source, destination, names in self.pending:
+        def add_missing(source, target):
+            for name, value in source.items():
+                if name not in target:
+                    target[name] = deepcopy(value)
+                elif isinstance(value, dict) and isinstance(target[name], dict):
+                    add_missing(value, target[name])
+
+        for source, destination, names, merge in self.pending:
             for name in names:
                 if name not in self.node(destination):
                     self.node(destination)[name] = deepcopy(self.node(source)[name])
+                elif merge:
+                    value, target = self.node(source)[name], self.node(destination)[name]
+                    if isinstance(value, dict) and isinstance(target, dict):
+                        add_missing(value, target)
         self.pending.clear()
 
 
@@ -52,6 +63,35 @@ class SyncTests(unittest.TestCase):
         config = deepcopy(CONFIG)
         config["existing_directories"] = policy
         return config
+
+    def test_default_config_checks_contents_of_existing_months_and_nested_directories(self):
+        self.assertEqual(CONFIG["existing_directories"], "recurse")
+        source = {"existing": b"source changed", "new": b"new",
+                  "nested": {"new-child": b"child"}}
+        target = {"existing": b"keep", "extra": b"target only", "nested": {}}
+        api = MemoryAPI({
+            "wangyuheng": {"2026": {"11": source}},
+            "gongyun": {"2026": {"11": deepcopy(target)}},
+            "local": {"2026": {"11": deepcopy(target)}},
+        })
+        syncer = Syncer(api, deepcopy(CONFIG))
+        syncer.run()
+        self.assertEqual(len(api.writes), 2)  # One whole-year merge per target.
+        self.assertEqual(syncer.counts["merge_directories_submitted"], 2)
+        self.assertEqual(syncer.counts["directories_skipped"], 0)
+        self.assertNotIn("/wangyuheng/2026/11/nested", api.reads)
+        self.assertNotIn("/wangyuheng/2026", api.reads)
+        for root in ("gongyun", "local"):
+            self.assertIn(("/wangyuheng", f"/{root}", ["2026"]), api.writes)
+            self.assertNotIn(f"/{root}/2026/11", api.reads)
+        self.assertTrue(all(merge for _, _, _, merge in api.pending))
+        api.finish_pending()
+        for root in ("gongyun", "local"):
+            month = api.tree[root]["2026"]["11"]
+            self.assertEqual(month["existing"], b"keep")
+            self.assertEqual(month["extra"], b"target only")
+            self.assertEqual(month["new"], b"new")
+            self.assertEqual(month["nested"]["new-child"], b"child")
 
     def test_one_source_two_targets_and_new_years(self):
         api = MemoryAPI({
@@ -79,7 +119,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(api.tree["gongyun"]["only-target.txt"], b"preserve")
         self.assertTrue(all(write[0] == "/wangyuheng" for write in api.writes))
 
-    def test_recurse_only_new_files_and_second_run_is_idempotent(self):
+    def test_recurse_only_new_files_and_second_run_preserves_content(self):
         api = MemoryAPI({
             "wangyuheng": {"2026": {"10": {"a.txt": b"changed", "b.txt": b"new"}}},
             "gongyun": {"2026": {"10": {"a.txt": b"keep"}}},
@@ -91,9 +131,12 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(api.tree[root]["2026"]["10"]["a.txt"], b"keep")
             self.assertEqual(api.tree[root]["2026"]["10"]["b.txt"], b"new")
         self.assertEqual(len(api.writes), 2)
+        before = deepcopy(api.tree)
         api.writes.clear()
         Syncer(api, self.config()).run()
-        self.assertEqual(api.writes, [])
+        self.assertEqual(len(api.writes), 2)  # Backend decides what is missing.
+        api.finish_pending()
+        self.assertEqual(api.tree, before)
 
     def test_strict_skip_existing_month_not_year_container(self):
         api = MemoryAPI({
@@ -123,8 +166,10 @@ class SyncTests(unittest.TestCase):
             "gongyun": {"2026": {"dir": b"keep", "file": {}}},
             "local": {"2026": {"dir": b"keep", "file": {}}},
         })
+        before = deepcopy(api.tree)
         Syncer(api, self.config()).run()
-        self.assertEqual(api.writes, [])
+        api.finish_pending()
+        self.assertEqual(api.tree, before)
 
     def test_failure_of_one_target_does_not_block_other_target(self):
         api = MemoryAPI({"wangyuheng": {"2026": {"x": b"x"}}, "local": {}})
@@ -152,7 +197,7 @@ class SyncTests(unittest.TestCase):
     def test_large_batch_is_split_into_bounded_requests(self):
         files = {f"file-{i:03}": b"x" for i in range(205)}
         api = MemoryAPI({"wangyuheng": {"2026": files}, "gongyun": {"2026": {}}, "local": {"2026": {}}})
-        Syncer(api, self.config()).run()
+        Syncer(api, self.config("skip")).run()
         self.assertEqual([len(names) for _, _, names in api.writes], [100, 100, 5, 100, 100, 5])
 
 
@@ -199,6 +244,17 @@ class APITests(unittest.TestCase):
             self.api.api = Mock(return_value=data)
             with self.assertRaises(SyncError):
                 self.api.submit_copy("/source", "/target", ["x"])
+
+    def test_server_side_merge_enters_directories_but_keeps_non_overwrite_flags(self):
+        self.api.api = Mock(return_value={"tasks": [{"id": "merge-1", "state": 0}]})
+        self.api.list_dir = Mock(side_effect=AssertionError("Must not scan file contents"))
+        self.api.submit_copy("/wangyuheng", "/gongyun", ["2026"], merge=True)
+        self.assertEqual(self.api.api.call_args.args[1], {
+            "src_dir": "/wangyuheng", "dst_dir": "/gongyun", "names": ["2026"],
+            "overwrite": False, "skip_existing": True, "merge": True,
+        })
+        self.api.api.assert_called_once()
+        self.api.list_dir.assert_not_called()
 
     def test_empty_batch_does_not_submit_anything(self):
         self.api.api = Mock()

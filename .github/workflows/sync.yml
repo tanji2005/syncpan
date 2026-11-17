@@ -19,11 +19,8 @@ on:
           - skip
           - recurse
   push:
-    paths:
-      - 'sync_openlist.py'
-      - 'tests/**'
-      - 'sync_config.json'
-      - '.github/workflows/sync.yml'
+    branches:
+      - main
   pull_request:
     paths:
       - 'sync_openlist.py'
@@ -45,7 +42,8 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
   sync:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Re-runs retain the original event name; push must be allowed here too.
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 15

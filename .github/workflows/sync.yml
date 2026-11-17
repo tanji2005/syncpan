@@ -48,7 +48,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 15
     concurrency:
       group: openlist-sync
       cancel-in-progress: false
@@ -61,5 +61,5 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Sync new files via OpenList server-side copy
+      - name: Submit copy tasks (OpenList transfers in background)
         run: python3 sync_openlist.py --config sync_config.json

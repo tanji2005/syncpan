@@ -5,6 +5,5 @@
   "start_year": 2026,
   "existing_directories": "skip",
   "request_timeout_seconds": 120,
-  "run_timeout_seconds": 18000,
-  "poll_interval_seconds": 10
+  "run_timeout_seconds": 600
 }

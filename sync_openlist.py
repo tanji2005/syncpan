@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add-only, server-side OpenList replication. Python standard library only."""
+"""Submit add-only OpenList copy tasks without waiting for file transfers."""
 
 import argparse
 from collections import Counter
@@ -12,11 +12,12 @@ import re
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 LOG = logging.getLogger("sync")
+BATCH_SIZE = 100
 
 
 class SyncError(Exception):
@@ -59,7 +60,7 @@ def validate_config(config):
         raise SyncError("existing_directories must be skip or recurse")
     if not 1000 <= config["start_year"] <= 9999:
         raise SyncError("Invalid start_year")
-    for key in ("request_timeout_seconds", "run_timeout_seconds", "poll_interval_seconds"):
+    for key in ("request_timeout_seconds", "run_timeout_seconds"):
         if config[key] <= 0:
             raise SyncError(f"{key} must be positive")
 
@@ -69,7 +70,6 @@ class OpenList:
         self.base_url = config["base_url"].rstrip("/")
         self.token = token
         self.timeout = config["request_timeout_seconds"]
-        self.interval = config["poll_interval_seconds"]
         self.deadline = time.monotonic() + config["run_timeout_seconds"]
         self.opener = build_opener(NoRedirect())
 
@@ -134,44 +134,26 @@ class OpenList:
                 raise SyncError(f"Incomplete directory listing: {path}")
             page += 1
 
-    def mkdir(self, path):
-        self.api("/api/fs/mkdir", {"path": path})
-
-    def copy_file(self, source, destination, entry):
-        name = entry["name"]
+    def submit_copy(self, source, destination, names):
+        if not names:
+            return []
+        for name in names:
+            child(source, name)
         data = self.api("/api/fs/copy", {
-            "src_dir": source, "dst_dir": destination, "names": [name],
+            "src_dir": source, "dst_dir": destination, "names": names,
             "overwrite": False, "skip_existing": True, "merge": False,
         })
-        # OpenList v4 returns tasks; a successful submission is NOT a completed copy.
+        # Directories are expanded by OpenList, not by this runner. A task may
+        # still be pending, running, or fail later; acceptance != completion.
         if data is not None and not isinstance(data, dict):
             raise SyncError("Unrecognized copy response")
         tasks = (data or {}).get("tasks", [])
         if not isinstance(tasks, list):
             raise SyncError("Invalid copy task list")
-        for task in tasks:
-            self.wait_task(task["id"])
-        # Also covers synchronous completion and a race where skip_existing applied.
-        target = self.list_dir(destination).get(name)
-        if not target or target["is_dir"]:
-            raise SyncError(f"Copy not verified: {destination}/{name}")
-        # A concurrent writer's same-name file must be left alone, even if its size differs.
-        if tasks and target.get("size") != entry.get("size"):
-            raise SyncError(f"Copy size mismatch: {destination}/{name}")
-
-    def wait_task(self, task_id):
-        while True:
-            info = self.api("/api/task/copy/info?" + urlencode({"tid": task_id}), {}, retry=True)
-            if not isinstance(info, dict):
-                raise SyncError(f"Invalid task response: {task_id}")
-            state = info.get("state")
-            if state == 2:  # tache.StateSucceeded
-                return
-            if state in (4, 7):  # StateCanceled, StateFailed
-                raise SyncError(f"Copy task {task_id} failed: {info.get('error', '')}")
-            if state not in (0, 1, 3, 5, 6, 8, 9):
-                raise SyncError(f"Unknown task state: {state!r}")
-            time.sleep(min(self.interval, self.remaining()))
+        if any(not isinstance(task, dict) or not isinstance(task.get("id"), str)
+               or not task["id"] for task in tasks):
+            raise SyncError("Invalid copy task ID")
+        return tasks
 
 
 class Syncer:
@@ -187,37 +169,43 @@ class Syncer:
             self.source_cache[path] = self.api.list_dir(path)
         return self.source_cache[path]
 
-    def make_directory(self, path):
-        LOG.info("%s mkdir %s", "PLAN" if self.dry_run else "CREATE", path)
-        self.counts["directories_planned" if self.dry_run else "directories_created"] += 1
-        if not self.dry_run:
-            self.api.mkdir(path)
+    def submit(self, source, destination, entries):
+        for offset in range(0, len(entries), BATCH_SIZE):
+            batch = entries[offset:offset + BATCH_SIZE]
+            names = [entry["name"] for entry in batch]
+            LOG.info("%s %s -> %s names=%s", "PLAN submit" if self.dry_run else "SUBMIT",
+                     source, destination, json.dumps(names, ensure_ascii=False))
+            if not self.dry_run:
+                tasks = self.api.submit_copy(source, destination, names)
+                self.counts["copy_requests_accepted"] += 1
+                self.counts["tasks_returned"] += len(tasks)
+                for task in tasks:
+                    LOG.info("ACCEPTED task_id=%s state=%s (not waiting)", task["id"], task.get("state"))
+            for entry in batch:
+                kind = "directories" if entry["is_dir"] else "files"
+                self.counts[f"{kind}_{'planned' if self.dry_run else 'submitted'}"] += 1
 
-    def tree(self, source, destination, *, new=False):
-        stack = [(source, destination, new)]
+    def tree(self, source, destination):
+        stack = [(source, destination)]
         while stack:
-            src, dst, virtual = stack.pop()
-            # Only a just-planned directory is virtual. Real directories are always refreshed.
-            target = {} if self.dry_run and virtual else self.api.list_dir(dst)
+            src, dst = stack.pop()
+            target = self.api.list_dir(dst)
             self.counts["directories_scanned"] += 1
+            missing = []
             for name, entry in sorted(self.source_entries(src).items()):
                 src_path, dst_path = child(src, name), child(dst, name)
                 existing = target.get(name)
                 if existing is not None:
                     if entry["is_dir"] and existing["is_dir"] and self.config["existing_directories"] == "recurse":
-                        stack.append((src_path, dst_path, False))
+                        stack.append((src_path, dst_path))
                     else:
                         self.counts["directories_skipped" if entry["is_dir"] else "files_skipped"] += 1
                         LOG.info("SKIP existing %s", dst_path)
                     continue
-                if entry["is_dir"]:
-                    self.make_directory(dst_path)
-                    stack.append((src_path, dst_path, True))
-                else:
-                    LOG.info("%s %s -> %s", "PLAN copy" if self.dry_run else "COPY", src_path, dst_path)
-                    if not self.dry_run:
-                        self.api.copy_file(src, dst, entry)
-                    self.counts["files_planned" if self.dry_run else "files_copied"] += 1
+                # Submit the whole missing directory. OpenList creates the folder
+                # and recursively queues its contents after this process exits.
+                missing.append(entry)
+            self.submit(src, dst, missing)
 
     def run(self):
         source = self.config["source_root"]
@@ -239,9 +227,10 @@ class Syncer:
                         self.counts["files_skipped"] += 1
                         continue
                     if entry is None:
-                        self.make_directory(dst)
+                        self.submit(source, root, [self.source_entries(source)[year]])
+                        continue
                     # Year directories are routing containers, not items subject to directory skipping.
-                    self.tree(src, dst, new=entry is None)
+                    self.tree(src, dst)
             except SyncError as exc:
                 LOG.error("Destination %s failed: %s", root, exc)
                 failures.append(root)
@@ -278,6 +267,7 @@ def main():
         syncer = Syncer(OpenList(config, token), config, dry_run)
         LOG.info("dry_run=%s existing_directories=%s", dry_run, config["existing_directories"])
         syncer.run()
+        LOG.info("Submission finished. Transfer completion is NOT checked; see OpenList copy tasks.")
         success = True
     except (SyncError, OSError, ValueError, KeyError, TypeError) as exc:
         LOG.error("%s", exc)
@@ -291,6 +281,7 @@ def main():
                 file.write(f"Result: **{'success' if success else 'failed'}**\n\n")
                 if syncer:
                     file.write(f"Dry run: `{syncer.dry_run}`; existing directories: `{syncer.config['existing_directories']}`\n\n")
+                file.write("This result only covers task submission, NOT file-transfer completion. Check OpenList copy tasks for final results.\n\n")
                 for key, value in sorted(counts.items()):
                     file.write(f"- {key}: {value}\n")
     return 0 if success else 1
